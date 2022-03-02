@@ -14,6 +14,7 @@ var ErrClosedConsumerGroup = errors.New("kafka: tried to use a consumer group th
 
 // ConsumerGroup is responsible for dividing up processing of topics and partitions
 // over a collection of processes (the members of the consumer group).
+// 消费者组对外暴露的interface，new方法中返回的就是这个
 type ConsumerGroup interface {
 	// Consume joins a cluster of consumers for a given list of topics and
 	// starts a blocking ConsumerGroupSession through the ConsumerGroupHandler.
@@ -41,42 +42,73 @@ type ConsumerGroup interface {
 	// This method should be called inside an infinite loop, when a
 	// server-side rebalance happens, the consumer session will need to be
 	// recreated to get the new claims.
+	// 需要传入给定的topic组，还有消费这些消息的接口实现ConsumerGroupHandler
+	// ConsumerGroupHandler 下面会讲到，暂时先看消费者组session内的生命周期步骤
+	// 1. 加入此消费者组，服务端会公平的分配partition到当前消费者
+	// 2. 程序启动前，会调用handler中的Setup()方法，可以通知用户和进行准备工作
+	// 3. 任何消息都会调用handler的ConsumeClaim()方法。
+	//   这个方法在每个独立的goroutine中需要是线程安全的，消费状态需要小心的维护
+	// 4. 消费者退出有三种情况handler的ConsumeClaim()退出；
+	//   服务端发起了一次rebalance；父级context触发了cancel()
+	// 5. 当所有ConsumeClaim()退出时，handler的Cleanup()钩子函数会被调用，
+	//   用以执行rebalance前的收尾工作
+	// 6. 消费完成时，标记并提交offset
+	// 有几点需要注意, 一旦rebalance触发，那么消息处理函数ConsumeClaim()必须在配置项
+	// Config.Consumer.Group.Rebalance.Timeout规定的时间内退出，而且需要给offset提交
+	// 和清理函数Cleanup()留出时间. 如果超时未完成，那么这个消费者会被kafka服务端从这个组中除名，
+	// 导致消息offset提交失败。
+	// 这个方法应该被放在无限循环中，因为当rebalance发生时，这个函数会退出，所以需要再次调用启动
 	Consume(ctx context.Context, topics []string, handler ConsumerGroupHandler) error
 
 	// Errors returns a read channel of errors that occurred during the consumer life-cycle.
 	// By default, errors are logged and not returned over this channel.
 	// If you want to implement any custom error handling, set your config's
 	// Consumer.Return.Errors setting to true, and read from this channel.
+	// Errors 接受sarama错误信息的channel，但是默认情况下，错误会直接打印日志而非发送到这里，
+	// 如果需要的话，可以将Consumer.Return.Errors设置为true，然后就可以监听这个channel了
 	Errors() <-chan error
 
 	// Close stops the ConsumerGroup and detaches any running sessions. It is required to call
 	// this function before the object passes out of scope, as it will otherwise leak memory.
+	// Close 停止consumerGroup并将所有session分离出去.
+	// 为防止内存泄露，要在对象逃逸之前调用这个函数
 	Close() error
 }
 
 type consumerGroup struct {
+	// 通用kafka client 管理连接，必须close防止逃逸
 	client Client
 
-	config   *Config
+	config *Config
+	// 管理真正的从broker消费消息的PartitionConsumer，必须close防止逃逸
 	consumer Consumer
-	groupID  string
+	// 组名
+	groupID string
+	// 集群中的成员ID
 	memberID string
-	errors   chan error
+	// 接收错误的channel
+	errors chan error
 
-	lock      sync.Mutex
-	closed    chan none
+	lock sync.Mutex
+	// 接收结束信号的channel
+	closed chan none
+	// 保证只close一次
 	closeOnce sync.Once
 
+	// ???
 	userData []byte
 }
 
 // NewConsumerGroup creates a new consumer group the given broker addresses and configuration.
+// NewConsumerGroup 主要工作是启动一个client，client的主要职责就是跟broker建tcp连接，保持更新元数据
 func NewConsumerGroup(addrs []string, groupID string, config *Config) (ConsumerGroup, error) {
+	// 起客户端，与broker保持通信，主要维护元数据
 	client, err := NewClient(addrs, config)
 	if err != nil {
 		return nil, err
 	}
 
+	// 起消费者组，主要就是把client组装进去
 	c, err := newConsumerGroup(groupID, client)
 	if err != nil {
 		_ = client.Close()
@@ -146,6 +178,7 @@ func (c *consumerGroup) Close() (err error) {
 // Consume implements ConsumerGroup.
 func (c *consumerGroup) Consume(ctx context.Context, topics []string, handler ConsumerGroupHandler) error {
 	// Ensure group is not closed
+	// fail fast
 	select {
 	case <-c.closed:
 		return ErrClosedConsumerGroup
@@ -161,11 +194,13 @@ func (c *consumerGroup) Consume(ctx context.Context, topics []string, handler Co
 	}
 
 	// Refresh metadata for requested topics
+	// 刷新下元数据
 	if err := c.client.RefreshMetadata(topics...); err != nil {
 		return err
 	}
 
 	// Init session
+	// 初始化 consumerGroupSession，启动真正的消费
 	sess, err := c.newSession(ctx, topics, handler, c.config.Consumer.Group.Rebalance.Retry.Max)
 	if err == ErrClosedClient {
 		return ErrClosedConsumerGroup
@@ -203,16 +238,18 @@ func (c *consumerGroup) retryNewSession(ctx context.Context, topics []string, ha
 }
 
 func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler ConsumerGroupHandler, retries int) (*consumerGroupSession, error) {
+	// 选定一个协调员？（broker）
 	coordinator, err := c.client.Coordinator(c.groupID)
 	if err != nil {
 		if retries <= 0 {
 			return nil, err
 		}
-
+		// 重试机制，次数默认4
 		return c.retryNewSession(ctx, topics, handler, retries, true)
 	}
 
 	// Join consumer group
+	// 发送加入组中的请求
 	join, err := c.joinGroupRequest(coordinator, topics)
 	if err != nil {
 		_ = coordinator.Close()
@@ -241,6 +278,7 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 	}
 
 	// Prepare distribution plan if we joined as the leader
+	// memberID 看来是发送加组请求后分配的唯一标识
 	var plan BalanceStrategyPlan
 	if join.LeaderId == join.MemberId {
 		members, err := join.GetMembers()
@@ -248,6 +286,7 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 			return nil, err
 		}
 
+		// 按配置中的策略分配，默认 BalanceStrategyRange
 		plan, err = c.balance(members)
 		if err != nil {
 			return nil, err
@@ -255,6 +294,7 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 	}
 
 	// Sync consumer group
+	// 看来类似ack，只是如果是leader的话，需要将分配完的计划返回
 	groupRequest, err := c.syncGroupRequest(coordinator, plan, join.GenerationId)
 	if err != nil {
 		_ = coordinator.Close()
@@ -375,6 +415,7 @@ func (c *consumerGroup) balance(members map[string]ConsumerGroupMemberMetadata) 
 		topics[topic] = partitions
 	}
 
+	// 按配置中的策略分配，默认 BalanceStrategyRange
 	strategy := c.config.Consumer.Group.Rebalance.Strategy
 	return strategy.Plan(members, topics)
 }
@@ -488,14 +529,18 @@ func (c *consumerGroup) topicToPartitionNumbers(topics []string) (map[string]int
 // --------------------------------------------------------------------
 
 // ConsumerGroupSession represents a consumer group member session.
+// ConsumerGroupSession 代表了一个consumerGroup的用户生命周期
 type ConsumerGroupSession interface {
 	// Claims returns information about the claimed partitions by topic.
+	// Claims 返回topic到被分配的partition数组的map
 	Claims() map[string][]int32
 
 	// MemberID returns the cluster member ID.
+	// MemberID 返回集群中的memberID
 	MemberID() string
 
 	// GenerationID returns the current generation ID.
+	// GenerationID 返回当前的GenerationID，这个字段类似选举的group Leader的版本号
 	GenerationID() int32
 
 	// MarkOffset marks the provided offset, alongside a metadata string
@@ -511,11 +556,21 @@ type ConsumerGroupSession interface {
 	// store immediately for efficiency reasons, and it may never be committed if
 	// your application crashes. This means that you may end up processing the same
 	// message twice, and your processing should ideally be idempotent.
+	// MarkOffset 标记offset，同时在metadata中记录一个字符串，用来标识当时partition
+	// consumer的状态，其他的consumer可以根据这个字符串恢复消费
+	//
+	// 按照上传约定, 调用这个方法时，你是在标记预期要读取的消息，而不是刚读取到的消息。
+	// 也正因此，调用这个方法时，你需要传入的参数是上一个消息的offset+1
+	//
+	// 注意：因为效率的原因，调用 MarkOffset时并不会立即执行消息的提交，所以如果程序崩溃时，有可能一些消息
+	// 并没有提交成功。也就是说你的程序有可能两次接受同样的一个消息，所以需要你的程序保证幂等性。
 	MarkOffset(topic string, partition int32, offset int64, metadata string)
 
 	// Commit the offset to the backend
 	//
 	// Note: calling Commit performs a blocking synchronous operation.
+	// Commit 就是我们熟知的消息提交了
+	// 注意: 调用Commit是一个同步阻塞的操作
 	Commit()
 
 	// ResetOffset resets to the provided offset, alongside a metadata string that
@@ -523,28 +578,38 @@ type ConsumerGroupSession interface {
 	// acts as a counterpart to MarkOffset, the difference being that it allows to
 	// reset an offset to an earlier or smaller value, where MarkOffset only
 	// allows incrementing the offset. cf MarkOffset for more details.
+	// ResetOffset 根据提供的值重置offset，同时在metadata中记录一个字符串，用来标识当时partition
+	// consumer的状态。重置操作对应 MarkOffset，不同之处在于，它可以传入一个比当前offset小的值，而
+	// MarkOffset只允许传入比当前offset大的值，详情请查阅 MarkOffset。
+	//（cf. 是一个拉丁语衍生的（也是现代英语）词汇confer的简写，表示“比较”或“查阅”的意思。 主要用于普通法和成文法文本中，还有学术著作。）
 	ResetOffset(topic string, partition int32, offset int64, metadata string)
 
 	// MarkMessage marks a message as consumed.
+	// MarkMessage 标记一个消息已经消费了。
 	MarkMessage(msg *ConsumerMessage, metadata string)
 
 	// Context returns the session context.
+	// Context 返回session中的context
 	Context() context.Context
 }
 
 type consumerGroupSession struct {
+	// 父级对象 consumerGroup
 	parent       *consumerGroup
 	memberID     string
 	generationID int32
 	handler      ConsumerGroupHandler
 
-	claims  map[string][]int32
+	claims map[string][]int32
+	// ？？？
 	offsets *offsetManager
 	ctx     context.Context
 	cancel  func()
 
-	waitGroup       sync.WaitGroup
-	releaseOnce     sync.Once
+	waitGroup sync.WaitGroup
+	// 保证资源清理只做一次
+	releaseOnce sync.Once
+	// ？？？
 	hbDying, hbDead chan none
 }
 
@@ -573,9 +638,11 @@ func newConsumerGroupSession(ctx context.Context, parent *consumerGroup, claims 
 	}
 
 	// start heartbeat loop
+	// 开始心跳，检测状态、处理错误，内有重试机制
 	go sess.heartbeatLoop()
 
 	// create a POM for each claim
+	// 发送请求，获取初始offset等信息
 	for topic, partitions := range claims {
 		for _, partition := range partitions {
 			pom, err := offsets.ManagePartition(topic, partition)
@@ -594,7 +661,9 @@ func newConsumerGroupSession(ctx context.Context, parent *consumerGroup, claims 
 	}
 
 	// perform setup
+	// 调用 ConsumerGroupHandler 的 Setup() 开始消费前的钩子
 	if err := handler.Setup(sess); err != nil {
+		// 无处不在的有问题就释放，可以用defer吧？
 		_ = sess.release(true)
 		return nil, err
 	}
@@ -664,6 +733,7 @@ func (s *consumerGroupSession) consume(topic string, partition int32) {
 	}
 
 	// create new claim
+	// 带着初始化的offset创建新的claim，起一个分区的消费者
 	claim, err := newConsumerGroupClaim(s, topic, partition, offset)
 	if err != nil {
 		s.parent.handleError(err, topic, partition)
@@ -678,6 +748,7 @@ func (s *consumerGroupSession) consume(topic string, partition int32) {
 	}()
 
 	// trigger close when session is done
+	// 再次判断是否close
 	go func() {
 		select {
 		case <-s.ctx.Done():
@@ -687,6 +758,7 @@ func (s *consumerGroupSession) consume(topic string, partition int32) {
 	}()
 
 	// start processing
+	// 执行 consumerGroupHandler 的 ConsumeClaim()， 开始执行业务消费
 	if err := s.handler.ConsumeClaim(s, claim); err != nil {
 		s.parent.handleError(err, topic, partition)
 	}
@@ -792,34 +864,48 @@ func (s *consumerGroupSession) heartbeatLoop() {
 //
 // PLEASE NOTE that handlers are likely be called from several goroutines concurrently,
 // ensure that all state is safely protected against race conditions.
+// ConsumerGroupHandler 处理独立的topic或者分区的消息。同时也提供了钩子方法，允许你在session生命周期
+// 的开始和结束时嵌入逻辑
 type ConsumerGroupHandler interface {
 	// Setup is run at the beginning of a new session, before ConsumeClaim.
+	// Setup 在session的开始阶段运行, 早于 ConsumeClaim.
 	Setup(ConsumerGroupSession) error
 
 	// Cleanup is run at the end of a session, once all ConsumeClaim goroutines have exited
 	// but before the offsets are committed for the very last time.
+	// Cleanup 在session的结束阶段运行, 在所有 ConsumeClaim 的goroutines 退出之后、但在最后
+	// 一次offset提交之前，调用且只调用一次
 	Cleanup(ConsumerGroupSession) error
 
 	// ConsumeClaim must start a consumer loop of ConsumerGroupClaim's Messages().
 	// Once the Messages() channel is closed, the Handler must finish its processing
 	// loop and exit.
+	// ConsumeClaim 必须起一个ConsumerGroupClaim的Messages()的循环，一旦Messages()关闭时，
+	// Handler 必须结束循环并退出
 	ConsumeClaim(ConsumerGroupSession, ConsumerGroupClaim) error
 }
 
 // ConsumerGroupClaim processes Kafka messages from a given topic and partition within a consumer group.
+// ConsumerGroupClaim 在一个consumerGroup之内，处理一个topic和partition中的消息.
 type ConsumerGroupClaim interface {
 	// Topic returns the consumed topic name.
+	// Topic 返回消费的topic
 	Topic() string
 
 	// Partition returns the consumed partition.
+	// Partition 返回消费的partition
 	Partition() int32
 
 	// InitialOffset returns the initial offset that was used as a starting point for this claim.
+	// InitialOffset 返回开始消费时初始化的offset
 	InitialOffset() int64
 
 	// HighWaterMarkOffset returns the high water mark offset of the partition,
 	// i.e. the offset that will be used for the next message that will be produced.
 	// You can use this to determine how far behind the processing is.
+	// HighWaterMarkOffset 返回服务端产生的下一条消息的offset（并不是客户端下一条接受的）。
+	// 你可以根据这个判断自己的处理程序落后了多少
+	//（i.e. 换句话说）
 	HighWaterMarkOffset() int64
 
 	// Messages returns the read channel for the messages that are returned by
@@ -827,6 +913,9 @@ type ConsumerGroupClaim interface {
 	// is due. You must finish processing and mark offsets within
 	// Config.Consumer.Group.Session.Timeout before the topic/partition is eventually
 	// re-assigned to another group member.
+	// Messages 返回从broker读消息的channel。这个channel当新的rebalance触发时会关闭. 你必须在
+	// Config.Consumer.Group.Session.Timeout 约定的时间内完成退出和标记offsets，这样才能让
+	// topic/partition重新分配成为消费组中的新成员
 	Messages() <-chan *ConsumerMessage
 }
 

@@ -135,6 +135,8 @@ func NewBroker(addr string) *Broker {
 // block waiting for the connection to succeed or fail. To get the effect of a fully synchronous Open call,
 // follow it by a call to Connected(). The only errors Open will return directly are ConfigurationError or
 // AlreadyConnected. If conf is nil, the result of NewConfig() is used.
+// Open 并发方式尝试去创建一个broker连接，如果已经连接过则会报错，并不会阻塞在这里，但是任何后续的broker操作都会阻塞等待连接成功或失败
+// 想要获取返回结果，可以调用函数 Connected()，唯一直接返回的错误是配置项校验。没有配置项写入时会使用 NewConfig()的默认配置。
 func (b *Broker) Open(conf *Config) error {
 	if !atomic.CompareAndSwapInt32(&b.opened, 0, 1) {
 		return ErrAlreadyConnected
@@ -155,6 +157,7 @@ func (b *Broker) Open(conf *Config) error {
 		defer b.lock.Unlock()
 
 		dialer := conf.getDialer()
+		// 建立一个tcp连接，尝试拨号
 		b.conn, b.connErr = dialer.Dial("tcp", b.addr)
 		if b.connErr != nil {
 			Logger.Printf("Failed to connect to broker %s: %s\n", b.addr, b.connErr)
@@ -163,6 +166,7 @@ func (b *Broker) Open(conf *Config) error {
 			return
 		}
 		if conf.Net.TLS.Enable {
+			// 包装为传输层安全的客户端
 			b.conn = tls.Client(b.conn, validServerNameTLS(b.addr, conf.Net.TLS.Config))
 		}
 
@@ -184,6 +188,7 @@ func (b *Broker) Open(conf *Config) error {
 			b.registerMetrics()
 		}
 
+		// SASL 简单身份验证和安全层
 		if conf.Net.SASL.Enable {
 			b.connErr = b.authenticateViaSASL()
 
@@ -208,6 +213,7 @@ func (b *Broker) Open(conf *Config) error {
 		} else {
 			Logger.Printf("Connected to broker at %s (unregistered)\n", b.addr)
 		}
+		// 监听返回内容
 		go withRecover(b.responseReceiver)
 	})
 
