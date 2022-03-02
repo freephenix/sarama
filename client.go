@@ -137,6 +137,7 @@ type client struct {
 // NewClient creates a new Client. It connects to one of the given broker addresses
 // and uses that broker to automatically fetch metadata on the rest of the kafka cluster. If metadata cannot
 // be retrieved from any of the given broker addresses, the client is not created.
+// NewClient 创建一个新的客户端，会随机选一个broker地址，自动拉取元数据信息，如果所有broker都拿不到地址，那客户端创建失败
 func NewClient(addrs []string, conf *Config) (Client, error) {
 	Logger.Println("Initializing new client")
 
@@ -163,10 +164,14 @@ func NewClient(addrs []string, conf *Config) (Client, error) {
 		coordinators:            make(map[string]int32),
 	}
 
+	// 多个broker时，打乱顺序
 	client.randomizeSeedBrokers(addrs)
 
+	// 默认为true，会多占些空间，不过会提前加载好元数据信息
+	// 为false时，则只会在下方开的goroutine里定时刷新元数据
 	if conf.Metadata.Full {
 		// do an initial fetch of all cluster metadata by specifying an empty list of topics
+		// 刷新元数据
 		err := client.RefreshMetadata()
 		switch err {
 		case nil:
@@ -180,6 +185,7 @@ func NewClient(addrs []string, conf *Config) (Client, error) {
 			return nil, err
 		}
 	}
+	// 起定时器，定期更新元数据
 	go withRecover(client.backgroundMetadataUpdater)
 
 	Logger.Println("Successfully initialized new client")
@@ -467,6 +473,7 @@ func (client *client) RefreshBrokers(addrs []string) error {
 }
 
 func (client *client) RefreshMetadata(topics ...string) error {
+	// 安全性判断
 	if client.Closed() {
 		return ErrClosedClient
 	}
@@ -474,12 +481,14 @@ func (client *client) RefreshMetadata(topics ...string) error {
 	// Prior to 0.8.2, Kafka will throw exceptions on an empty topic and not return a proper
 	// error. This handles the case by returning an error instead of sending it
 	// off to Kafka. See: https://github.com/Shopify/sarama/pull/38#issuecomment-26362310
+	// topic校验
 	for _, topic := range topics {
 		if topic == "" {
 			return ErrInvalidTopic // this is the error that 0.8.2 and later correctly return
 		}
 	}
 
+	// 添加超时时间
 	deadline := time.Time{}
 	if client.conf.Metadata.Timeout > 0 {
 		deadline = time.Now().Add(client.conf.Metadata.Timeout)
@@ -680,6 +689,7 @@ func (client *client) any() *Broker {
 	client.lock.RLock()
 	defer client.lock.RUnlock()
 
+	// 初始化时，能看到是从这里取的，seedBrokers 和 brokers区别待梳理
 	if len(client.seedBrokers) > 0 {
 		_ = client.seedBrokers[0].Open(client.conf)
 		return client.seedBrokers[0]
@@ -851,6 +861,7 @@ func (client *client) refreshMetadata() error {
 }
 
 func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int, deadline time.Time) error {
+	// 超时控制函数
 	pastDeadline := func(backoff time.Duration) bool {
 		if !deadline.IsZero() && time.Now().Add(backoff).After(deadline) {
 			// we are past the deadline
@@ -858,8 +869,10 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int,
 		}
 		return false
 	}
+	// 重试函数
 	retry := func(err error) error {
 		if attemptsRemaining > 0 {
+			// 配置中有退步函数则用退步函数生成，没有则固定配置值
 			backoff := client.computeBackoff(attemptsRemaining)
 			if pastDeadline(backoff) {
 				Logger.Println("client/metadata skipping last retries as we would go past the metadata timeout")
@@ -874,6 +887,8 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int,
 		return err
 	}
 
+	// 从顶部选取一个broker，尝试建连
+	// 如果选的seedBroker则为随机，选的是broker中的则不能保证是随机的
 	broker := client.any()
 	for ; broker != nil && !pastDeadline(0); broker = client.any() {
 		allowAutoTopicCreation := client.conf.Metadata.AllowAutoTopicCreation
@@ -890,11 +905,13 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int,
 		} else if client.conf.Version.IsAtLeast(V0_10_0_0) {
 			req.Version = 1
 		}
+		// 请求获取元数据
 		response, err := broker.GetMetadata(req)
 		switch err := err.(type) {
 		case nil:
 			allKnownMetaData := len(topics) == 0
 			// valid response, use it
+			// 用返回值更新元数据信息
 			shouldRetry, err := client.updateMetadata(response, allKnownMetaData)
 			if shouldRetry {
 				Logger.Println("client/metadata found some partitions to be leaderless")
@@ -936,7 +953,9 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int,
 	}
 
 	Logger.Println("client/metadata no available broker to send metadata request to")
+	// 恢复断连的brokers，写入seedBrokers，进行
 	client.resurrectDeadBrokers()
+	// ErrOutOfBrokers 提前传入闭包的返回值，成功则返回成功的内容，否则返回自定义的传入错误
 	return retry(ErrOutOfBrokers)
 }
 
