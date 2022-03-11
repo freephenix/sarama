@@ -144,6 +144,8 @@ func (c *consumer) ConsumePartition(topic string, partition int32, offset int64)
 		fetchSize: c.conf.Consumer.Fetch.Default,
 	}
 
+	// 这里会拿到最新offset和最旧offset，这里允许在此之间的所有值
+	// 但是在外面的配置校验时只允许最新或者最旧，所以如果想自定义offset，只能在handler的setup钩子方法中修改
 	if err := child.chooseStartingOffset(offset); err != nil {
 		return nil, err
 	}
@@ -350,6 +352,7 @@ func (child *partitionConsumer) dispatcher() {
 				child.broker = nil
 			}
 
+			// 重新获取broker
 			Logger.Printf("consumer/%s/%d finding new broker\n", child.topic, child.partition)
 			if err := child.dispatch(); err != nil {
 				child.sendError(err)
@@ -471,11 +474,14 @@ feederLoop:
 			child.interceptors(msg)
 		messageSelect:
 			select {
+			// 停止信号
 			case <-child.dying:
 				child.broker.acks.Done()
 				continue feederLoop
+			// 正常消息
 			case child.messages <- msg:
 				firstAttempt = true
+			// 最大处理时间超时 conf.Consumer.MaxProcessingTim
 			case <-expiryTicker.C:
 				if !firstAttempt {
 					child.responseResult = errTimedOut
@@ -492,6 +498,7 @@ feederLoop:
 					child.broker.input <- child
 					continue feederLoop
 				} else {
+					// 进入这里说明有新来的消息或者还没有新来的消息，所以置firstAttempt的值，尝试进行ack并且更新partitionConsumer
 					// current message has not been sent, return to select
 					// statement
 					firstAttempt = false
@@ -589,6 +596,7 @@ func (child *partitionConsumer) parseResponse(response *FetchResponse) ([]*Consu
 		return nil, nil
 	}
 
+	// 拿取属于自己的数据块
 	block := response.GetBlock(child.topic, child.partition)
 	if block == nil {
 		return nil, ErrIncompleteResponse
@@ -731,6 +739,7 @@ type brokerConsumer struct {
 	refs             int
 }
 
+// newBrokerConsumer broker消费者，真实从broker订阅消息
 func (c *consumer) newBrokerConsumer(broker *Broker) *brokerConsumer {
 	bc := &brokerConsumer{
 		consumer:         c,
@@ -759,11 +768,13 @@ func (bc *brokerConsumer) subscriptionManager() {
 	for {
 		if len(buffer) > 0 {
 			select {
+			// 收到了需要更新的partitionConsumer
 			case event, ok := <-bc.input:
 				if !ok {
 					goto done
 				}
 				buffer = append(buffer, event)
+			// 发送到newSubscriptions，交给subscriptionConsumer的goroutine去更新
 			case bc.newSubscriptions <- buffer:
 				buffer = nil
 			case bc.wait <- none{}:
@@ -790,8 +801,10 @@ done:
 
 // subscriptionConsumer ensures we will get nil right away if no new subscriptions is available
 func (bc *brokerConsumer) subscriptionConsumer() {
+	// 没有 bc.newSubscriptions 可用时走到这里，启动更新
 	<-bc.wait // wait for our first piece of work
 
+	//
 	for newSubscriptions := range bc.newSubscriptions {
 		bc.updateSubscriptions(newSubscriptions)
 
@@ -802,6 +815,7 @@ func (bc *brokerConsumer) subscriptionConsumer() {
 			continue
 		}
 
+		// 主动拉取消息
 		response, err := bc.fetchNewMessages()
 		if err != nil {
 			Logger.Printf("consumer/broker/%d disconnecting due to error processing FetchRequest: %s\n", bc.broker.ID(), err)
@@ -810,10 +824,12 @@ func (bc *brokerConsumer) subscriptionConsumer() {
 		}
 
 		bc.acks.Add(len(bc.subscriptions))
+		// 把拉来的结果，发送到每一个子consumer中
 		for child := range bc.subscriptions {
 			child.feeder <- response
 		}
 		bc.acks.Wait()
+		// 主要是有报错时，关闭订阅&把错误送到子consumer的err chan
 		bc.handleResponses()
 	}
 }

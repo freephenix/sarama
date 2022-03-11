@@ -79,6 +79,7 @@ func newOffsetManagerFromClient(group, memberID string, generation int32, client
 }
 
 func (om *offsetManager) ManagePartition(topic string, partition int32) (PartitionOffsetManager, error) {
+	// 对每个partition起一个offsetManager
 	pom, err := om.newPartitionOffsetManager(topic, partition)
 	if err != nil {
 		return nil, err
@@ -152,6 +153,7 @@ func (om *offsetManager) fetchInitialOffset(topic string, partition int32, retri
 	req.ConsumerGroup = om.group
 	req.AddPartition(topic, partition)
 
+	// 拿取现在各partition的offset
 	resp, err := broker.FetchOffset(req)
 	if err != nil {
 		if retries <= 0 {

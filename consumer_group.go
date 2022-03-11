@@ -927,6 +927,7 @@ type consumerGroupClaim struct {
 }
 
 func newConsumerGroupClaim(sess *consumerGroupSession, topic string, partition int32, offset int64) (*consumerGroupClaim, error) {
+	// 真正的执行消费
 	pcm, err := sess.parent.consumer.ConsumePartition(topic, partition, offset)
 	if err == ErrOffsetOutOfRange {
 		offset = sess.parent.config.Consumer.Offsets.Initial
