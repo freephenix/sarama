@@ -809,6 +809,7 @@ func (b *Broker) sendAndReceive(req protocolBody, res protocolBody) error {
 		return nil
 	}
 
+	// 等待ResponseReceiver处理完结果后返回，可能是成功的packets，也可能是错误的errors
 	select {
 	case buf := <-promise.packets:
 		return versionedDecode(buf, res, req.version())
@@ -878,6 +879,7 @@ func (b *Broker) encode(pe packetEncoder, version int16) (err error) {
 	return nil
 }
 
+// background goroutine 处理结构体
 func (b *Broker) responseReceiver() {
 	var dead error
 

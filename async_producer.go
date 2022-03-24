@@ -422,7 +422,7 @@ func (p *asyncProducer) newTopicProducer(topic string) chan<- *ProducerMessage {
 }
 
 func (tp *topicProducer) dispatch() {
-	// 从topic发送者发过来的消息
+	// 从最外层统一的发送者扔过来的消息
 	for msg := range tp.input {
 		if msg.retries == 0 {
 			// 对消息分区，确定需要分发到哪个partition
@@ -567,7 +567,7 @@ func (pp *partitionProducer) dispatch() {
 		}
 	}()
 
-	// 从分区发送者发过来的消息
+	// 从topic发送者扔过来的消息
 	for msg := range pp.input {
 		if pp.brokerProducer != nil && pp.brokerProducer.abandoned != nil {
 			select {
@@ -637,7 +637,7 @@ func (pp *partitionProducer) dispatch() {
 			msg.hasSequence = true
 		}
 
-		// 把从partition发送者来的消息扔给broker发送者
+		// 把partition发送者的消息扔给broker发送者
 		pp.brokerProducer.input <- msg
 	}
 }
@@ -847,7 +847,8 @@ func (bp *brokerProducer) run() {
 			// 如果时间未到，会优先于下一步的发送阻塞住，如果时间到了，那就置标记，就会将output赋值，就可以真实发送了
 			bp.timerFired = true
 		case output <- bp.buffer:
-			// 如果output为nil，会阻塞，但是因为上面定时器的存在，要么先一步阻塞，要么output已经有值，不会阻塞
+			// 正常来讲，如果output为nil，往里发消息会阻塞
+			// 但是在select的case中是一个特例，这里并不会造成阻塞，而是强行禁用此case
 			bp.rollOver()
 		case response, ok := <-bp.responses:
 			if ok {

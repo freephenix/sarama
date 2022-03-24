@@ -681,6 +681,7 @@ func newConsumerGroupSession(ctx context.Context, parent *consumerGroup, claims 
 				defer sess.cancel()
 
 				// consume a single topic/partition, blocking
+				// 真正开始消费，以topic下partition为单位
 				sess.consume(topic, partition)
 			}(topic, partition)
 		}
@@ -733,7 +734,7 @@ func (s *consumerGroupSession) consume(topic string, partition int32) {
 	}
 
 	// create new claim
-	// 带着初始化的offset创建新的claim，起一个分区的消费者
+	// 核心；带着初始化的offset创建新的claim，起一个分区的消费者
 	claim, err := newConsumerGroupClaim(s, topic, partition, offset)
 	if err != nil {
 		s.parent.handleError(err, topic, partition)

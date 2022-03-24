@@ -161,8 +161,10 @@ func (c *consumer) ConsumePartition(topic string, partition int32, offset int64)
 	}
 
 	go withRecover(child.dispatcher)
+	// 用来处理从broker拉取的最新消息
 	go withRecover(child.responseFeeder)
 
+	// 如何拉取消息看brokerConsumer
 	child.broker = c.refBrokerConsumer(leader)
 	child.broker.input <- child
 
@@ -464,6 +466,9 @@ func (child *partitionConsumer) responseFeeder() {
 
 feederLoop:
 	for response := range child.feeder {
+		// 筛选出自己关心的消息（topic、partition）
+		// 为什么是partitionConsumer自己筛选而不是broker分配？
+		//   因为分配就意味着需要知道细节，需要感知变化，空间换时间
 		msgs, child.responseResult = child.parseResponse(response)
 
 		if child.responseResult == nil {
@@ -751,7 +756,9 @@ func (c *consumer) newBrokerConsumer(broker *Broker) *brokerConsumer {
 		refs:             0,
 	}
 
+	// 更新partition消费者
 	go withRecover(bc.subscriptionManager)
+	// 统一从broker拉取新的消息
 	go withRecover(bc.subscriptionConsumer)
 
 	return bc
@@ -824,7 +831,7 @@ func (bc *brokerConsumer) subscriptionConsumer() {
 		}
 
 		bc.acks.Add(len(bc.subscriptions))
-		// 把拉来的结果，发送到每一个子consumer中
+		// 把拉来的结果，发送到每一个partition consumer中
 		for child := range bc.subscriptions {
 			child.feeder <- response
 		}
